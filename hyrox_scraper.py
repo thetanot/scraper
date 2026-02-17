@@ -1,18 +1,24 @@
 """
 HYROX Results Scraper
 Scrapes race results from https://results.hyrox.com/
-Uses Playwright to handle the dynamic JavaScript content.
-Optimized for speed: reduced waits, lighter load, API interception, browser reuse.
+Optimized: page.evaluate() for fast extraction, HTML fallback, caching.
 """
 
 import argparse
 import csv
+import hashlib
+import json
 import re
 import time
 from pathlib import Path
 from typing import Optional
 
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+# In-memory cache: key -> (results, timestamp)
+_RESULTS_CACHE: dict[str, tuple[list[dict], float]] = {}
+CACHE_TTL_SECONDS = 3600  # 1 hour
 
 # Optimized browser launch args (faster startup, fewer resources)
 BROWSER_ARGS = [
@@ -22,6 +28,34 @@ BROWSER_ARGS = [
     "--disable-gpu",
     "--no-sandbox",
 ]
+
+
+def _cache_key(season_url: str, race: str | None, division: str | None, workout: str | None,
+               first_name: str | None, last_name: str | None, gender: str | None,
+               age_group: str | None, nationality: str | None, results_per_page: int) -> str:
+    """Generate cache key from request params."""
+    raw = json.dumps([
+        season_url, race, division, workout,
+        first_name, last_name, gender, age_group, nationality,
+        results_per_page,
+    ], sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _get_cached(key: str) -> list[dict] | None:
+    """Return cached results if valid, else None."""
+    if key not in _RESULTS_CACHE:
+        return None
+    results, ts = _RESULTS_CACHE[key]
+    if time.time() - ts > CACHE_TTL_SECONDS:
+        del _RESULTS_CACHE[key]
+        return None
+    return results
+
+
+def _set_cached(key: str, results: list[dict]) -> None:
+    """Store results in cache."""
+    _RESULTS_CACHE[key] = (results, time.time())
 
 
 def scrape_hyrox_results(
@@ -58,6 +92,23 @@ def scrape_hyrox_results(
     """
     all_results = []
     api_results = []  # Captured from XHR if available
+
+    # Check cache first
+    cache_key = _cache_key(
+        season_url, race, division, workout,
+        first_name, last_name, gender, age_group, nationality,
+        results_per_page,
+    )
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        if output_file and cached:
+            Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(output_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=cached[0].keys(), extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(cached)
+            print(f"Cache hit: saved {len(cached)} results to {output_file}")
+        return cached
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=BROWSER_ARGS)
@@ -194,13 +245,15 @@ def scrape_hyrox_results(
         finally:
             browser.close()
 
-    if all_results and output_file:
-        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=all_results[0].keys(), extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(all_results)
-        print(f"Saved {len(all_results)} results to {output_file}")
+    if all_results:
+        _set_cached(cache_key, all_results)
+        if output_file:
+            Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(output_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=all_results[0].keys(), extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(all_results)
+            print(f"Saved {len(all_results)} results to {output_file}")
     elif not all_results and not output_file:
         pass  # API mode, no console message needed
     elif not all_results:
@@ -254,97 +307,129 @@ def _parse_api_results(api_data: list) -> list[dict]:
 
 
 def _find_next_page_button(page):
-    print("finding next page")
-
-    try:
-        # Scope to pagination container
-        pagination = page.locator("ul.pagination")
-
-        if pagination.count() == 0:
-            return None
-
-        next_btn = page.locator(
-            "ul.pagination li.pages-nav-button a:has-text('›'), \
-            ul.pagination li.pages-nav-button a:has-text('»'), \
-            ul.pagination li.pages-nav-button a:has-text('>')"
-        ).first
-
-        if next_btn.count() > 0 and next_btn.is_visible() and next_btn.is_enabled():
-            return next_btn
-
-    except Exception as e:
-        print("pagination error:", e)
-
+    """Find pagination Next button."""
+    selectors = [
+        "ul.pagination li.pages-nav-button a",
+        "ul.pagination li.next a",
+        "a.next:not(.disabled)",
+        "a[rel='next']",
+        "[aria-label='Next']",
+        "a:has-text('›')",
+        "a:has-text('»')",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible() and el.is_enabled():
+                return el
+        except Exception:
+            continue
     return None
+
+
+EXTRACT_JS = """
+() => {
+  const results = [];
+  // Single selector: li that has type-fullname (unique result rows only)
+  const rows = document.querySelectorAll('li');
+  for (const li of rows) {
+    const fn = li.querySelector('.type-fullname');
+    if (!fn) continue;
+    const rp = li.querySelector('.place-primary');
+    const rs = li.querySelector('.place-secondary');
+    const nat = li.querySelector('.nation__abbr');
+    const ag = li.querySelector('.list-label');
+    const full_name = (fn && fn.textContent) ? fn.textContent.trim() : '';
+    const rank_division = (rp && rp.textContent) ? rp.textContent.trim() : '';
+    const ag_rank = (rs && rs.textContent) ? rs.textContent.trim() : '';
+    const nation = (nat && nat.textContent) ? nat.textContent.trim() : '';
+    const age_group = (ag && ag.textContent) ? ag.textContent.trim() : '';
+    if (full_name || rank_division) {
+      results.push({ full_name, rank_division, ag_rank, nation, age_group });
+    }
+  }
+  return results;
+}
+"""
+
+EXTRACT_TABLE_JS = """
+() => {
+  const results = [];
+  const rows = document.querySelectorAll('table tbody tr');
+  const headerCells = document.querySelectorAll('table thead th');
+  const headers = [...headerCells].map(h => h.textContent.trim()).filter(Boolean);
+  for (const tr of rows) {
+    const cells = tr.querySelectorAll('td');
+    if (cells.length === 0) continue;
+    const texts = [...cells].map(c => c.textContent.trim());
+    if (headers.length === texts.length) {
+      results.push(Object.fromEntries(headers.map((h, i) => [h, texts[i]])));
+    } else {
+      results.push(Object.fromEntries(texts.map((t, i) => ['Column_' + (i+1), t])));
+    }
+  }
+  return results;
+}
+"""
 
 
 def _extract_results_from_page(page) -> tuple[list[dict], list[str]]:
     """
-    Extract results from page. Mika Timing uses li elements with specific classes.
-    Falls back to table extraction if no list items found.
-
-    Field mappings (from Mika Timing list layout):
-    - .list-field.type-fullname -> full_name
-    - .list-field.type-place.place-primary -> rank_division
-    - .list-field.type-place.place-secondary -> ag_rank
-    - .nation__abbr -> nation
-    - .list-label (visible-xs-block visible-sm-block) -> age_group
+    Extract results in ONE round-trip via page.evaluate(). Falls back to
+    HTML parse then table evaluate if list layout returns empty.
     """
+    # 1. Try list layout (single JS call)
+    try:
+        results = page.evaluate(EXTRACT_JS)
+        if results and isinstance(results, list):
+            return results, []
+    except Exception:
+        pass
+
+    # 2. Fallback: get HTML and parse with BeautifulSoup
+    try:
+        container = page.locator(".list-list, ul.list, .results-list").first
+        if container.count() > 0:
+            html = container.inner_html()
+            results = _parse_results_html(html)
+            if results:
+                return results, []
+    except Exception:
+        pass
+
+    # 3. Fallback: table layout (single JS call)
+    try:
+        results = page.evaluate(EXTRACT_TABLE_JS)
+        if results and isinstance(results, list):
+            return results, []
+    except Exception:
+        pass
+
+    return [], []
+
+
+def _parse_results_html(html: str) -> list[dict]:
+    """Parse results from HTML with BeautifulSoup (fallback when evaluate fails)."""
     results = []
-    headers = []
-
-    # Try li-based layout first (Mika Timing results list)
-    # Select li elements that contain result fields (fullname, place-primary, etc.)
-    list_rows = page.locator(
-        "li:has(.type-fullname), li:has(.place-primary), li:has(.nation__abbr), "
-        "ul.list li, ul.list-results li, .list-list li"
-    ).all()
-
-    if list_rows:
-        for row in list_rows:
-            def _text(sel: str) -> str:
-                try:
-                    el = row.locator(sel).first
-                    if el.is_visible() or "hidden" not in (el.get_attribute("class") or ""):
-                        return el.inner_text().strip()
-                except Exception:
-                    pass
-                return ""
-
-            record = {
-                "full_name": _text(".list-field.type-fullname") or _text(".type-fullname"),
-                "rank_division": _text(".list-field.type-place.place-primary") or _text(".place-primary"),
-                "ag_rank": _text(".list-field.type-place.place-secondary") or _text(".place-secondary"),
-                "nation": _text(".nation__abbr"),
-                "age_group": _text(".type-age_class"),
-            }
-            # Only add if we got at least full_name or rank
-            if record["full_name"] or record["rank_division"]:
-                results.append({k: v for k, v in record.items()})
-
-    # Fallback: table layout
-    if not results:
-        rows = page.locator(
-            "table.results tbody tr, table tbody tr, .result-row, .results-table tr, [data-result]"
-        ).all()
-        if not rows:
-            rows = page.locator("tr").filter(has=page.locator("td")).all()
-
-        header_el = page.locator("table thead th, table tr:first-child th").first
-        if header_el.is_visible():
-            headers = [h.inner_text().strip() for h in page.locator("table thead th, table tr:first-child th").all()]
-
-        for row in rows:
-            cells = row.locator("td").all()
-            if not cells:
-                continue
-            texts = [c.inner_text().strip() for c in cells]
-            if headers and len(headers) == len(texts):
-                results.append(dict(zip(headers, texts)))
-            else:
-                results.append({f"Column_{i+1}": t for i, t in enumerate(texts)})
-
-    return results, headers
+    soup = BeautifulSoup(html, "html.parser")
+    for li in soup.select("li"):
+        fn = li.select_one(".type-fullname")
+        if not fn:
+            continue
+        rp = li.select_one(".place-primary")
+        rs = li.select_one(".place-secondary")
+        nat = li.select_one(".nation__abbr")
+        ag = li.select_one(".list-label")
+        record = {
+            "full_name": (fn.get_text(strip=True) if fn else "") or "",
+            "rank_division": (rp.get_text(strip=True) if rp else "") or "",
+            "ag_rank": (rs.get_text(strip=True) if rs else "") or "",
+            "nation": (nat.get_text(strip=True) if nat else "") or "",
+            "age_group": (ag.get_text(strip=True) if ag else "") or "",
+        }
+        if record["full_name"] or record["rank_division"]:
+            results.append(record)
+    return results
 
 
 def _extract_select_options(page, selector: str) -> list[dict]:
@@ -404,7 +489,7 @@ def fetch_form_options(
         try:
             page.goto(season_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_selector("#default-lists-event_main_group", timeout=10000)
-            time.sleep(0.5)
+            # time.sleep(0.5)
 
             result["races"] = _extract_select_options(page, "#default-lists-event_main_group")
 
