@@ -338,12 +338,14 @@ EXTRACT_JS = """
     const rp = li.querySelector('.place-primary');
     const rs = li.querySelector('.place-secondary');
     const nat = li.querySelector('.nation__abbr');
-    const ag = li.querySelector('.list-label');
+    const ag = li.querySelector('.type-age_class');
+    
     const full_name = (fn && fn.textContent) ? fn.textContent.trim() : '';
     const rank_division = (rp && rp.textContent) ? rp.textContent.trim() : '';
     const ag_rank = (rs && rs.textContent) ? rs.textContent.trim() : '';
     const nation = (nat && nat.textContent) ? nat.textContent.trim() : '';
-    const age_group = (ag && ag.textContent) ? ag.textContent.trim() : '';
+    const age_group = (ag && ag.textContent) ? ag.textContent.replace('Age Group', '').trim() : '';
+   
     if (full_name || rank_division) {
       results.push({ full_name, rank_division, ag_rank, nation, age_group });
     }
