@@ -32,12 +32,13 @@ BROWSER_ARGS = [
 
 def _cache_key(season_url: str, race: str | None, division: str | None, workout: str | None,
                first_name: str | None, last_name: str | None, gender: str | None,
-               age_group: str | None, nationality: str | None, results_per_page: int) -> str:
+               age_group: str | None, nationality: str | None, results_per_page: int,
+               fetch_profile_details: bool = False) -> str:
     """Generate cache key from request params."""
     raw = json.dumps([
         season_url, race, division, workout,
         first_name, last_name, gender, age_group, nationality,
-        results_per_page,
+        results_per_page, fetch_profile_details,
     ], sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -69,7 +70,8 @@ def scrape_hyrox_results(
     age_group: str | None = None,
     nationality: str | None = None,
     results_per_page: int = 100,
-    output_file: Optional[str] = "hyrox_results.csv",
+    output_file: Optional[str] = "hyrox_results.json",
+    fetch_profile_details: bool = True,
     headless: bool = True,
     debug: bool = False,
 ) -> list[dict]:
@@ -93,20 +95,18 @@ def scrape_hyrox_results(
     all_results = []
     api_results = []  # Captured from XHR if available
 
-    # Check cache first
+    # Check cache first (only when not fetching profiles - profile data not cached)
     cache_key = _cache_key(
         season_url, race, division, workout,
         first_name, last_name, gender, age_group, nationality,
-        results_per_page,
+        results_per_page, fetch_profile_details,
     )
-    cached = _get_cached(cache_key)
+    cached = _get_cached(cache_key) if not fetch_profile_details else None
     if cached is not None:
         if output_file and cached:
             Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-            with open(output_file, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=cached[0].keys(), extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(cached)
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(cached, f, indent=2, ensure_ascii=False)
             print(f"Cache hit: saved {len(cached)} results to {output_file}")
         return cached
 
@@ -233,6 +233,11 @@ def scrape_hyrox_results(
 
                 page_num += 1
 
+            # Fetch profile details for each person (click each link, extract data)
+            if fetch_profile_details and all_results:
+                print(f"Fetching profile details for {len(all_results)} athletes...")
+                _fetch_all_profile_details(page, all_results)
+
             if api_results and debug:
                 print("API responses captured:", len(api_results))
 
@@ -246,13 +251,12 @@ def scrape_hyrox_results(
             browser.close()
 
     if all_results:
-        _set_cached(cache_key, all_results)
+        if not fetch_profile_details:
+            _set_cached(cache_key, all_results)
         if output_file:
             Path(output_file).parent.mkdir(parents=True, exist_ok=True)
-            with open(output_file, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=all_results[0].keys(), extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(all_results)
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(all_results, f, indent=2, ensure_ascii=False)
             print(f"Saved {len(all_results)} results to {output_file}")
     elif not all_results and not output_file:
         pass  # API mode, no console message needed
@@ -330,24 +334,23 @@ def _find_next_page_button(page):
 EXTRACT_JS = """
 () => {
   const results = [];
-  // Single selector: li that has type-fullname (unique result rows only)
   const rows = document.querySelectorAll('li');
   for (const li of rows) {
     const fn = li.querySelector('.type-fullname');
     if (!fn) continue;
+    const anchor = fn.querySelector('a') || fn.closest('a');
+    const profile_link = (anchor && anchor.href) ? anchor.href : '';
     const rp = li.querySelector('.place-primary');
     const rs = li.querySelector('.place-secondary');
     const nat = li.querySelector('.nation__abbr');
-    const ag = li.querySelector('.type-age_class');
-    
+    const ag = li.querySelector('.list-label') || li.querySelector('.type-age_class');
     const full_name = (fn && fn.textContent) ? fn.textContent.trim() : '';
     const rank_division = (rp && rp.textContent) ? rp.textContent.trim() : '';
     const ag_rank = (rs && rs.textContent) ? rs.textContent.trim() : '';
     const nation = (nat && nat.textContent) ? nat.textContent.trim() : '';
     const age_group = (ag && ag.textContent) ? ag.textContent.replace('Age Group', '').trim() : '';
-   
     if (full_name || rank_division) {
-      results.push({ full_name, rank_division, ag_rank, nation, age_group });
+      results.push({ full_name, rank_division, ag_rank, nation, age_group, profile_link });
     }
   }
   return results;
@@ -364,11 +367,16 @@ EXTRACT_TABLE_JS = """
     const cells = tr.querySelectorAll('td');
     if (cells.length === 0) continue;
     const texts = [...cells].map(c => c.textContent.trim());
+    const anchor = tr.querySelector('a[href]');
+    const profile_link = anchor && anchor.href ? anchor.href : '';
+    let obj;
     if (headers.length === texts.length) {
-      results.push(Object.fromEntries(headers.map((h, i) => [h, texts[i]])));
+      obj = Object.fromEntries(headers.map((h, i) => [h, texts[i]]));
     } else {
-      results.push(Object.fromEntries(texts.map((t, i) => ['Column_' + (i+1), t])));
+      obj = Object.fromEntries(texts.map((t, i) => ['Column_' + (i+1), t]));
     }
+    obj.profile_link = profile_link;
+    results.push(obj);
   }
   return results;
 }
@@ -393,7 +401,8 @@ def _extract_results_from_page(page) -> tuple[list[dict], list[str]]:
         container = page.locator(".list-list, ul.list, .results-list").first
         if container.count() > 0:
             html = container.inner_html()
-            results = _parse_results_html(html)
+            base = page.url.split("/season-")[0] if "/season-" in page.url else "https://results.hyrox.com"
+            results = _parse_results_html(html, base)
             if results:
                 return results, []
     except Exception:
@@ -410,7 +419,7 @@ def _extract_results_from_page(page) -> tuple[list[dict], list[str]]:
     return [], []
 
 
-def _parse_results_html(html: str) -> list[dict]:
+def _parse_results_html(html: str, base_url: str = "https://results.hyrox.com") -> list[dict]:
     """Parse results from HTML with BeautifulSoup (fallback when evaluate fails)."""
     results = []
     soup = BeautifulSoup(html, "html.parser")
@@ -418,6 +427,11 @@ def _parse_results_html(html: str) -> list[dict]:
         fn = li.select_one(".type-fullname")
         if not fn:
             continue
+        anchor = fn.select_one("a") or fn.find_parent("a")
+        profile_link = ""
+        if anchor and anchor.get("href"):
+            href = anchor["href"]
+            profile_link = href if href.startswith("http") else f"{base_url.rstrip('/')}{href}" if href.startswith("/") else f"{base_url}/{href}"
         rp = li.select_one(".place-primary")
         rs = li.select_one(".place-secondary")
         nat = li.select_one(".nation__abbr")
@@ -428,10 +442,129 @@ def _parse_results_html(html: str) -> list[dict]:
             "ag_rank": (rs.get_text(strip=True) if rs else "") or "",
             "nation": (nat.get_text(strip=True) if nat else "") or "",
             "age_group": (ag.get_text(strip=True) if ag else "") or "",
+            "profile_link": profile_link,
         }
         if record["full_name"] or record["rank_division"]:
             results.append(record)
     return results
+
+
+# Map detail-box ID to output block name
+DETAIL_BOX_NAMES = {
+    "detail-box-other": "workout_summary",
+    "detail-box-splits": "splits",
+    "detail-box-racereplay": "racereplay",
+    "detail-box-overalltime": "overalltime",
+    "detail-box-judging": "judging_decision",
+}
+
+PERSON_DETAIL_JS = """
+(boxNames) => {
+  const sanitize = (s) => (s || '').trim().replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+  const result = {};
+  const extractTableAsRows = (tbl) => {
+    const thead = tbl.querySelector('thead');
+    const tbody = tbl.querySelector('tbody');
+    if (!thead || !tbody) return null;
+    const headerRow = thead.querySelector('tr');
+    if (!headerRow) return null;
+    const headers = Array.from(headerRow.querySelectorAll('th')).map(th => sanitize(th.textContent.trim()) || 'col');
+    const rows = [];
+    tbody.querySelectorAll('tr').forEach(tr => {
+      const cells = tr.querySelectorAll('td, th');
+      if (cells.length === 0) return;
+      const row = {};
+      cells.forEach((cell, i) => {
+        const key = headers[i] || ('col_' + i);
+        row[key] = cell.textContent.trim();
+      });
+      rows.push(row);
+    });
+    return rows.length > 0 ? rows : null;
+  };
+  const extractPairs = (container) => {
+    const pairs = {};
+    container.querySelectorAll('dl').forEach(dl => {
+      const dts = dl.querySelectorAll('dt');
+      const dds = dl.querySelectorAll('dd');
+      dts.forEach((dt, i) => {
+        const key = sanitize(dt.textContent) || 'field_' + i;
+        if (key) pairs[key] = (dds[i] && dds[i].textContent.trim()) || '';
+      });
+    });
+    container.querySelectorAll('table').forEach(tbl => {
+      if (tbl.querySelector('thead')) return;
+      tbl.querySelectorAll('tr').forEach(tr => {
+        const cells = tr.querySelectorAll('td, th');
+        if (cells.length >= 2) {
+          const k = sanitize(cells[0].textContent);
+          if (k && !pairs[k]) pairs[k] = cells[1].textContent.trim();
+        }
+      });
+    });
+    return pairs;
+  };
+  const extractFromContainer = (container) => {
+    const tbl = container.querySelector('table');
+    if (tbl && tbl.querySelector('thead')) {
+      const rows = extractTableAsRows(tbl);
+      if (rows) return { _type: 'table', rows };
+    }
+    const pairs = extractPairs(container);
+    if (Object.keys(pairs).length > 0) return { _type: 'pairs', pairs };
+    return null;
+  };
+  for (const [boxId, blockName] of Object.entries(boxNames)) {
+    const box = document.getElementById(boxId);
+    if (box) {
+      const data = extractFromContainer(box);
+      if (data) {
+        result[blockName] = data._type === 'table' ? data.rows : data.pairs;
+      }
+    }
+  }
+  document.querySelectorAll('[id^="detail-box-"]').forEach(box => {
+    const id = box.id;
+    const blockName = boxNames[id] || id.replace('detail-box-', '');
+    if (!result[blockName]) {
+      const data = extractFromContainer(box);
+      if (data) {
+        result[blockName] = data._type === 'table' ? data.rows : data.pairs;
+      }
+    }
+  });
+  return result;
+}
+"""
+
+
+def _fetch_person_detail(page, profile_url: str) -> dict:
+    """Navigate to person's profile URL and extract detail data from detail-box divs."""
+    if not profile_url or not profile_url.startswith("http"):
+        return {}
+    try:
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=15000)
+        time.sleep(0.0)
+        detail = page.evaluate(PERSON_DETAIL_JS, DETAIL_BOX_NAMES)
+        return detail if isinstance(detail, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fetch_all_profile_details(page, results: list[dict]) -> None:
+    """Fetch profile detail for each unique profile_link. Merge into all results with that link."""
+    url_to_detail: dict[str, dict] = {}
+    for r in results:
+        link = r.get("profile_link") or ""
+        if not link or link in url_to_detail:
+            continue
+        detail = _fetch_person_detail(page, link)
+        url_to_detail[link] = detail
+        time.sleep(0.3)
+    for r in results:
+        link = r.get("profile_link") or ""
+        if link and link in url_to_detail and url_to_detail[link]:
+            r["profile"] = url_to_detail[link]
 
 
 def _extract_select_options(page, selector: str) -> list[dict]:
@@ -584,12 +717,14 @@ def fetch_seasons(headless: bool = True) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser(description="Scrape HYROX race results")
     parser.add_argument("--url", default="https://results.hyrox.com/season-8/", help="Season URL")
-    parser.add_argument("--race", help="Filter by race name")
-    parser.add_argument("--division", help="Filter by division")
+    parser.add_argument("--race", help="Race name")
+    parser.add_argument("--division", help="Division")
+    parser.add_argument("--workout", default="Total", help="Workout/ranking type")
     parser.add_argument("--first-name", help="Filter by athlete first name")
     parser.add_argument("--last-name", help="Filter by athlete last name")
     parser.add_argument("--per-page", type=int, default=100, choices=[25, 50, 100])
-    parser.add_argument("-o", "--output", default="hyrox_results.csv", help="Output CSV")
+    parser.add_argument("-o", "--output", default="hyrox_results.json", help="Output JSON file")
+    parser.add_argument("--no-profiles", action="store_true", help="Skip fetching profile details")
     parser.add_argument("--visible", action="store_true", help="Show browser (debug)")
     parser.add_argument("--debug", action="store_true", help="Save HTML and show API URLs")
     args = parser.parse_args()
@@ -598,10 +733,12 @@ def main():
         season_url=args.url,
         race=args.race,
         division=args.division,
+        workout=args.workout,
         first_name=args.first_name,
         last_name=args.last_name,
         results_per_page=args.per_page,
         output_file=args.output,
+        fetch_profile_details=not args.no_profiles,
         headless=not args.visible,
         debug=args.debug,
     )

@@ -122,7 +122,7 @@ curl -X POST "http://localhost:8000/api/results" \
   -d '{"season": "Season 25/26", "race": "2025 London Excel", "division": "HYROX PRO", "workout": "1000m SkiErg"}'
 ```
 
-**Response:**
+**Response (JSON):**
 
 ```json
 {
@@ -131,10 +131,24 @@ curl -X POST "http://localhost:8000/api/results" \
   "season_url": "https://results.hyrox.com/season-8/",
   "count": 42,
   "results": [
-    { "Rank": "1", "Name": "...", "Time": "...", ... }
+    {
+      "full_name": "Smith, John",
+      "rank_division": "1",
+      "ag_rank": "1",
+      "nation": "GBR",
+      "age_group": "25-29",
+      "profile_link": "https://results.hyrox.com/...",
+      "profile": {
+        "Bib": "123",
+        "Finish_Time": "1:05:30",
+        ...
+      }
+    }
   ]
 }
 ```
+
+Each result includes `profile_link` (from the name) and `profile` (detail data from that link).
 
 ---
 

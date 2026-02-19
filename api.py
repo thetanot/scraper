@@ -31,6 +31,10 @@ class ResultsRequest(BaseModel):
     age_group: Optional[str] = Field(None, description="Filter by age group (e.g., '25-29', '30-34')")
     nationality: Optional[str] = Field(None, description="Filter by nationality (e.g., 'United Kingdom')")
     per_page: int = Field(100, ge=25, le=100, description="Results per page (25, 50, or 100)")
+    fetch_profile_details: bool = Field(
+        True,
+        description="Fetch each athlete's profile page and include detail data",
+    )
 
 
 app = FastAPI(
@@ -65,7 +69,8 @@ def post_results(body: ResultsRequest):
             age_group=body.age_group,
             nationality=body.nationality,
             results_per_page=body.per_page,
-            output_file="hyrox_result.csv",
+            output_file="justsome.json",
+            fetch_profile_details=body.fetch_profile_details,
             headless=False,
             debug=False,
         )
