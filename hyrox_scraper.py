@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+PROFILE_WORKERS = 6  # Reserved for future use; currently sequential for reliability
+
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -72,6 +74,7 @@ def scrape_hyrox_results(
     results_per_page: int = 100,
     output_file: Optional[str] = "hyrox_results.json",
     fetch_profile_details: bool = True,
+    profile_workers: int = PROFILE_WORKERS,
     headless: bool = True,
     debug: bool = False,
 ) -> list[dict]:
@@ -151,7 +154,7 @@ def scrape_hyrox_results(
                     page.locator("#default-lists-event_main_group").select_option(
                         label=re.compile(re.escape(race), re.I)
                     )
-                    time.sleep(1)
+                    time.sleep(0.5)
                 except Exception as e:
                     if debug:
                         print(f"Race filter failed: {e}")
@@ -233,10 +236,13 @@ def scrape_hyrox_results(
 
                 page_num += 1
 
-            # Fetch profile details for each person (click each link, extract data)
+            # Fetch profile details for each person
             if fetch_profile_details and all_results:
-                print(f"Fetching profile details for {len(all_results)} athletes...")
-                _fetch_all_profile_details(page, all_results)
+                n_profiles = len({r.get("profile_link") or "" for r in all_results if (r.get("profile_link") or "").startswith("http")})
+                print(f"Fetching profile details for {n_profiles} athletes...")
+                _fetch_all_profile_details(
+                    context, all_results, workers=profile_workers, headless=headless
+                )
 
             if api_results and debug:
                 print("API responses captured:", len(api_results))
@@ -539,28 +545,51 @@ PERSON_DETAIL_JS = """
 
 
 def _fetch_person_detail(page, profile_url: str) -> dict:
-    """Navigate to person's profile URL and extract detail data from detail-box divs."""
+    """Navigate to profile URL and extract detail data (waits for detail boxes)."""
     if not profile_url or not profile_url.startswith("http"):
         return {}
     try:
         page.goto(profile_url, wait_until="domcontentloaded", timeout=15000)
-        time.sleep(0.0)
+        page.wait_for_selector(
+            "#detail-box-other, #detail-box-splits",
+            state="attached",
+            timeout=8000,
+        )
+        time.sleep(0.3)
         detail = page.evaluate(PERSON_DETAIL_JS, DETAIL_BOX_NAMES)
         return detail if isinstance(detail, dict) else {}
     except Exception:
         return {}
 
 
-def _fetch_all_profile_details(page, results: list[dict]) -> None:
-    """Fetch profile detail for each unique profile_link. Merge into all results with that link."""
-    url_to_detail: dict[str, dict] = {}
+def _fetch_all_profile_details(
+    context,
+    results: list[dict],
+    workers: int = PROFILE_WORKERS,
+    headless: bool = True,
+) -> None:
+    """Fetch profile details sequentially using the existing browser context."""
+    unique_urls = []
+    seen = set()
     for r in results:
         link = r.get("profile_link") or ""
-        if not link or link in url_to_detail:
-            continue
-        detail = _fetch_person_detail(page, link)
-        url_to_detail[link] = detail
-        time.sleep(0.3)
+        if link and link.startswith("http") and link not in seen:
+            seen.add(link)
+            unique_urls.append(link)
+
+    if not unique_urls:
+        return
+
+    page = context.new_page()
+    url_to_detail: dict[str, dict] = {}
+    try:
+        for i, url in enumerate(unique_urls):
+            url_to_detail[url] = _fetch_person_detail(page, url)
+            if i < len(unique_urls) - 1:
+                time.sleep(0.3)
+    finally:
+        page.close()
+
     for r in results:
         link = r.get("profile_link") or ""
         if link and link in url_to_detail and url_to_detail[link]:
@@ -725,6 +754,8 @@ def main():
     parser.add_argument("--per-page", type=int, default=100, choices=[25, 50, 100])
     parser.add_argument("-o", "--output", default="hyrox_results.json", help="Output JSON file")
     parser.add_argument("--no-profiles", action="store_true", help="Skip fetching profile details")
+    parser.add_argument("--profile-workers", type=int, default=PROFILE_WORKERS,
+                        help=f"Parallel workers for profile fetching (default: {PROFILE_WORKERS})")
     parser.add_argument("--visible", action="store_true", help="Show browser (debug)")
     parser.add_argument("--debug", action="store_true", help="Save HTML and show API URLs")
     args = parser.parse_args()
@@ -739,6 +770,7 @@ def main():
         results_per_page=args.per_page,
         output_file=args.output,
         fetch_profile_details=not args.no_profiles,
+        profile_workers=args.profile_workers,
         headless=not args.visible,
         debug=args.debug,
     )

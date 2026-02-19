@@ -9,7 +9,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from hyrox_scraper import fetch_form_options, fetch_seasons, scrape_hyrox_results, season_string_to_id
+from hyrox_scraper import PROFILE_WORKERS, fetch_form_options, fetch_seasons, scrape_hyrox_results, season_string_to_id
 
 
 class ResultsRequest(BaseModel):
@@ -34,6 +34,12 @@ class ResultsRequest(BaseModel):
     fetch_profile_details: bool = Field(
         True,
         description="Fetch each athlete's profile page and include detail data",
+    )
+    profile_workers: int = Field(
+        PROFILE_WORKERS,
+        ge=1,
+        le=16,
+        description="Number of parallel workers for profile fetching (default: 6)",
     )
 
 
@@ -71,6 +77,7 @@ def post_results(body: ResultsRequest):
             results_per_page=body.per_page,
             output_file="justsome.json",
             fetch_profile_details=body.fetch_profile_details,
+            profile_workers=body.profile_workers,
             headless=False,
             debug=False,
         )
