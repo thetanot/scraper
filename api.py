@@ -79,7 +79,7 @@ def post_results(body: ResultsRequest):
             fetch_profile_details=body.fetch_profile_details,
             profile_workers=body.profile_workers,
             headless=False,
-            debug=False,
+            debug=True,
         )
     except Exception as e:
         return JSONResponse(

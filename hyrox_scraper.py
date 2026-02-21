@@ -14,7 +14,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-PROFILE_WORKERS = 6  # Parallel browser processes for profile fetching
+PROFILE_WORKERS = 20  # Parallel browser processes for profile fetching
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -77,7 +77,7 @@ def scrape_hyrox_results(
     fetch_profile_details: bool = True,
     profile_workers: int = PROFILE_WORKERS,
     headless: bool = True,
-    debug: bool = False,
+    debug: bool = True,
 ) -> list[dict]:
     """
     Scrape HYROX race results using Playwright.
@@ -152,60 +152,68 @@ def scrape_hyrox_results(
             # Apply filters (only when specified - skip unnecessary waits)
             if race:
                 try:
-                    page.locator("#default-lists-event_main_group").select_option(
-                        label=re.compile(re.escape(race), re.I)
-                    )
+                    race_select = page.locator("#default-lists-event_main_group")
+                    race_select.scroll_into_view_if_needed()
+                    race_select.select_option(value=race.strip())
                     time.sleep(1.5)
-                    # wait until division dropdown reloads with race-specific options
                     page.wait_for_function("""
                         () => {
                             const el = document.querySelector('#default-lists-event');
-                            if (!el) return false;
-                            return el.options.length > 1;
+                            return el && el.options.length > 1;
                         }
                     """, timeout=15000)
                     time.sleep(0.5)
-                except Exception as e:
-                    if debug:
-                        print(f"Race filter failed: {e}")
+                except Exception:
+                    try:
+                        race_select.select_option(label=race.strip())
+                        time.sleep(1.5)
+                        page.wait_for_function("""
+                            () => {
+                                const el = document.querySelector('#default-lists-event');
+                                return el && el.options.length > 1;
+                            }
+                        """, timeout=15000)
+                    except Exception as e:
+                        if debug:
+                            print(f"Race filter failed: {e}")
 
             if division:
                 try:
-                    div = division.strip()
-                    # Allow hyphen/en-dash/em-dash (site may use – instead of -)
-                    div_escaped = re.escape(div.replace("\u2013", "-").replace("\u2014", "-"))
-                    div_pat = div_escaped.replace(r"\-", r"[\-\u2013\u2014]") if "-" in div else div_escaped
-                    page.locator("#default-lists-event").select_option(
-                        label=re.compile(div_pat, re.I)
-                    )
-                    time.sleep(0.5)
-                    # confirm the intended division was selected
-                    page.wait_for_function("""
-                        (expected) => {
-                            const el = document.querySelector('#default-lists-event');
-                            if (!el) return false;
-                            const selected = el.options[el.selectedIndex];
-                            if (!selected) return false;
-                            const text = selected.textContent.trim().toLowerCase();
-                            const exp = expected.toLowerCase();
-                            return text.includes(exp) || exp.includes(text);
+                    div_text = division.strip().replace("\u2013", "-").replace("\u2014", "-").lower()
+                    selected = page.evaluate("""
+                        (searchText) => {
+                            const norm = (s) => (s || '').replace(/[\u2013\u2014]/g, '-').trim().toLowerCase();
+                            const sel = document.querySelector('#default-lists-event');
+                            if (!sel) return false;
+                            const opts = sel.options;
+                            const n = norm(searchText);
+                            for (let i = 0; i < opts.length; i++) {
+                                const text = norm(opts[i].textContent || '');
+                                if (text.includes(n) || n.includes(text)) {
+                                    sel.selectedIndex = i;
+                                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                    return true;
+                                }
+                            }
+                            return false;
                         }
-                    """, division.strip(), timeout=10000)
+                    """, div_text)
+                    if not selected and debug:
+                        print(f"Division '{division}' not found in dropdown")
+                    time.sleep(0.5)
                 except Exception as e:
                     if debug:
                         print(f"Division filter failed: {e}")
 
             if workout:
                 try:
-                    page.locator("#default-lists-ranking").select_option(
-                        label=re.compile(re.escape(workout), re.I)
-                    )
+                    page.locator("#default-lists-ranking").select_option(label=workout.strip())
                 except Exception as e:
                     if debug:
                         print(f"Workout filter failed: {e}")
             else:
                 try:
-                    page.locator("#default-lists-ranking").select_option(label=re.compile("Total", re.I))
+                    page.locator("#default-lists-ranking").select_option(label="Total")
                 except Exception:
                     pass
 
@@ -214,42 +222,79 @@ def scrape_hyrox_results(
             if first_name:
                 page.locator("#default-lists-firstname").fill(first_name)
             if gender:
-                page.locator("#default-lists-sex").select_option(label=re.compile(re.escape(gender), re.I))
+                g = gender.strip()
+                g_map = {"men": "Men", "women": "Women", "mixed": "Mixed"}
+                page.locator("#default-lists-sex").select_option(label=g_map.get(g.lower(), g))
             if age_group:
-                page.locator("#default-lists-age_class").select_option(label=re.compile(re.escape(age_group), re.I))
+                page.locator("#default-lists-age_class").select_option(label=age_group.strip())
             if nationality:
-                page.locator("#default-lists-nation").select_option(label=re.compile(re.escape(nationality), re.I))
+                page.locator("#default-lists-nation").select_option(label=nationality.strip())
 
             page.locator("#default-num_results").select_option(value=str(min(results_per_page, 100)))
 
             show_btn = page.locator("#default-submit, button:has-text('Show Results')").first
             show_btn.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                page.wait_for_load_state("load")
             page.wait_for_selector(
-                "li:has(.type-fullname), li:has(.place-primary), table.results tbody tr, .list-list",
+                "li.list-group-item .place-primary, li .type-fullname, .type-relay_member, table tbody tr",
                 timeout=15000,
             )
-            time.sleep(0.5)
+            time.sleep(2)
 
             all_results, headers = _extract_results_from_page(page)
 
+            if not all_results and api_results:
+                parsed = _parse_api_results(api_results)
+                if parsed:
+                    for r in parsed:
+                        r.setdefault("profile_link", "")
+                    all_results = parsed
+
+            if not all_results and debug:
+                Path("debug_results_page.html").write_text(page.content(), encoding="utf-8")
+                print("Extraction empty - saved debug_results_page.html")
+
             max_pages = 500
             page_num = 1
+
+            def _row_key(r):
+                return tuple(str(v) for v in r.values()) if r else ()
+
             while page_num < max_pages:
                 next_btn = _find_next_page_button(page)
                 if next_btn is None:
                     break
 
+                first_name_before = ""
+                if all_results:
+                    first_name_before = str(all_results[0].get("full_name", ""))
                 next_btn.scroll_into_view_if_needed()
                 next_btn.click()
                 page.wait_for_load_state("domcontentloaded")
-                time.sleep(1)
+                time.sleep(2)
+                try:
+                    page.wait_for_function(
+                        """
+                        (expected) => {
+                            const fn = document.querySelector('.type-fullname');
+                            const cell = document.querySelector('table tbody tr td a');
+                            const name = fn ? (fn.textContent || '').trim() : (cell ? cell.textContent : '').trim();
+                            return !expected || name !== expected;
+                        }
+                        """,
+                        first_name_before,
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
                 page_results, _ = _extract_results_from_page(page)
                 if not page_results:
                     break
-
-                def _row_key(r):
-                    return tuple(str(v) for v in r.values()) if r else ()
 
                 seen = {_row_key(r) for r in all_results}
                 new_count = 0
@@ -261,7 +306,6 @@ def scrape_hyrox_results(
                         new_count += 1
                 if new_count == 0:
                     break
-
                 page_num += 1
 
             if fetch_profile_details and all_results:
@@ -279,7 +323,8 @@ def scrape_hyrox_results(
                 raise
         finally:
             if not headless:
-                time.sleep(2)  # Pause so user can see results before close
+                print("Keeping browser open for 15 seconds...")
+                time.sleep(15)
             browser.close()
 
     if all_results:
@@ -336,6 +381,7 @@ def _parse_api_results(api_data: list) -> list[dict]:
                 "ag_rank": str(r.get("age_rank") or r.get("ag_rank") or r.get("place2") or ""),
                 "nation": str(r.get("nation") or r.get("nation_abbr") or r.get("country") or ""),
                 "age_group": str(r.get("age_class") or r.get("age_group") or ""),
+                "profile_link": r.get("profile_link") or r.get("link") or "",
             }
             if row["full_name"] or row["rank_division"]:
                 rows.append(row)
@@ -343,20 +389,32 @@ def _parse_api_results(api_data: list) -> list[dict]:
 
 
 def _find_next_page_button(page):
-    """Find pagination Next button."""
+    """Find pagination Next button (Mika Timing / HYROX style)."""
     selectors = [
-        "ul.pagination li.pages-nav-button a",
-        "ul.pagination li.next a",
-        "a.next:not(.disabled)",
-        "a[rel='next']",
-        "[aria-label='Next']",
-        "a:has-text('›')",
-        "a:has-text('»')",
+        ("ul.pagination li.pages-nav-button:last-of-type a", "first"),
+        ("ul.pagination li.pages-nav-button a", "last"),
+        ("ul.pagination li.next a", "first"),
+        ("ul.pagination li a:has-text('›')", "first"),
+        ("ul.pagination li a:has-text('»')", "first"),
+        ("a.next:not(.disabled)", "first"),
+        ("a[rel='next']", "first"),
+        ("[aria-label='Next']", "first"),
     ]
-    for sel in selectors:
+    for sel, which in selectors:
         try:
-            el = page.locator(sel).first
-            if el.is_visible() and el.is_enabled():
+            loc = page.locator(sel)
+            el = loc.last if which == "last" else loc.first
+            if el.count() > 0 and el.is_visible():
+                try:
+                    if el.get_attribute("aria-disabled") == "true":
+                        continue
+                    href = el.get_attribute("href") or ""
+                    if href == "#":
+                        continue
+                    if href and re.search(r"[?&]page=1(?:&|$)", href):
+                        continue
+                except Exception:
+                    pass
                 return el
         except Exception:
             continue
@@ -366,7 +424,8 @@ def _find_next_page_button(page):
 EXTRACT_JS = """
 () => {
   const results = [];
-  const rows = document.querySelectorAll('li');
+  let rows = document.querySelectorAll('#list li, .list-list li, ul.list li');
+  if (!rows.length) rows = document.querySelectorAll('li');
   for (const li of rows) {
     const fn = li.querySelector('.type-fullname');
     if (!fn) continue;
@@ -381,6 +440,31 @@ EXTRACT_JS = """
     const ag_rank = (rs && rs.textContent) ? rs.textContent.trim() : '';
     const nation = (nat && nat.textContent) ? nat.textContent.trim() : '';
     const age_group = (ag && ag.textContent) ? ag.textContent.replace('Age Group', '').trim() : '';
+    if (full_name || rank_division) {
+      results.push({ full_name, rank_division, ag_rank, nation, age_group, profile_link });
+    }
+  }
+  return results;
+}
+"""
+
+EXTRACT_LIST_GROUP_JS = """
+() => {
+  const results = [];
+  const rows = document.querySelectorAll('li.list-group-item.row:not(.list-group-header)');
+  for (const li of rows) {
+    const rp = li.querySelector('.place-primary');
+    const rs = li.querySelector('.place-secondary');
+    const memberEl = li.querySelector('.type-relay_member');
+    const anchor = memberEl ? memberEl.querySelector('a') || memberEl : null;
+    const full_name = anchor ? (anchor.textContent || '').trim() : (memberEl ? (memberEl.textContent || '').trim() : '');
+    const profile_link = anchor && anchor.href ? anchor.href : '';
+    const rank_division = (rp && rp.textContent) ? rp.textContent.trim() : '';
+    const ag_rank = (rs && rs.textContent) ? rs.textContent.trim() : '';
+    const ageEl = li.querySelector('.type-age_class');
+    const age_group = ageEl ? (ageEl.textContent || '').replace(/Age Group/gi, '').trim() : '';
+    const natEl = li.querySelector('.nation__abbr');
+    const nation = (natEl && natEl.textContent) ? natEl.textContent.trim() : '';
     if (full_name || rank_division) {
       results.push({ full_name, rank_division, ag_rank, nation, age_group, profile_link });
     }
@@ -417,10 +501,18 @@ EXTRACT_TABLE_JS = """
 
 def _extract_results_from_page(page) -> tuple[list[dict], list[str]]:
     """
-    Extract results in ONE round-trip via page.evaluate(). Falls back to
-    HTML parse then table evaluate if list layout returns empty.
+    Extract results via page.evaluate(). Handles list-group (Mika/HYROX results page),
+    type-fullname list, and table layouts.
     """
-    # 1. Try list layout (single JS call)
+    # 1. Try list-group layout (HYROX results page: li.list-group-item, type-relay_member)
+    try:
+        results = page.evaluate(EXTRACT_LIST_GROUP_JS)
+        if results and isinstance(results, list):
+            return results, []
+    except Exception:
+        pass
+
+    # 2. Try type-fullname list layout
     try:
         results = page.evaluate(EXTRACT_JS)
         if results and isinstance(results, list):
@@ -428,7 +520,7 @@ def _extract_results_from_page(page) -> tuple[list[dict], list[str]]:
     except Exception:
         pass
 
-    # 2. Fallback: get HTML and parse with BeautifulSoup
+    # 3. Fallback: get HTML and parse with BeautifulSoup
     try:
         container = page.locator(".list-list, ul.list, .results-list").first
         if container.count() > 0:
@@ -715,9 +807,7 @@ def fetch_form_options(
 
             if race and result["races"]:
                 try:
-                    page.locator("#default-lists-event_main_group").select_option(
-                        label=re.compile(re.escape(race), re.I)
-                    )
+                    page.locator("#default-lists-event_main_group").select_option(label=race)
                     time.sleep(1)
                 except Exception:
                     pass
@@ -807,6 +897,9 @@ def main():
     parser.add_argument("--workout", default="Total", help="Workout/ranking type")
     parser.add_argument("--first-name", help="Filter by athlete first name")
     parser.add_argument("--last-name", help="Filter by athlete last name")
+    parser.add_argument("--gender", help="Filter by gender (Men, Women, Mixed)")
+    parser.add_argument("--age-group", help="Filter by age group")
+    parser.add_argument("--nationality", help="Filter by nationality")
     parser.add_argument("--per-page", type=int, default=100, choices=[25, 50, 100])
     parser.add_argument("-o", "--output", default="hyrox_results.json", help="Output JSON file")
     parser.add_argument("--no-profiles", action="store_true", help="Skip fetching profile details")
@@ -823,6 +916,9 @@ def main():
         workout=args.workout,
         first_name=args.first_name,
         last_name=args.last_name,
+        gender=args.gender,
+        age_group=args.age_group,
+        nationality=args.nationality,
         results_per_page=args.per_page,
         output_file=args.output,
         fetch_profile_details=not args.no_profiles,

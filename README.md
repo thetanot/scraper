@@ -42,10 +42,10 @@ python hyrox_scraper.py --first-name "John" --last-name "Smith"
 
 ```bash
 python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" \
-  --race "2025 Stockholm" \
-  --division "HYROX" \
-  --first-name "John" \
-  --last-name "Smith" \
+  --race "2026 Las vegas" \
+  --division "HYROX PRO DOUBLES - Friday" \
+  --first-name "" \
+  --last-name "" \
   --per-page 100 \
   -o results.csv \
   --visible   # Show browser window (useful for debugging)
@@ -58,6 +58,9 @@ python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" \
 | `--division`   | Filter by division (HYROX PRO, HYROX, etc.)      |
 | `--first-name` | Filter by athlete first name                     |
 | `--last-name`  | Filter by athlete last name                      |
+| `--gender`     | Filter by gender (Men, Women, Mixed)             |
+| `--age-group`  | Filter by age group                              |
+| `--nationality`| Filter by nationality                            |
 | `--per-page`   | Results per page: 25, 50, or 100                  |
 | `-o`           | Output CSV file path                             |
 | `--visible`    | Run with visible browser (for debugging)         |
@@ -207,3 +210,29 @@ curl "http://localhost:8000/api/options?season=Season%2025%2F26"
 
 
 
+
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX PRO DOUBLES - Friday"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_PRO_DOUBLES_Friday_men.json" --visible 
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX DOUBLES - Friday"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_DOUBLES_Friday_men.json" --visible 
+
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX TEAM RELAY - Friday"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_TEAM_RELAY_Friday.json" --visible 
+
+
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX PRO DOUBLES - Friday" --gender="women"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_PRO_DOUBLES_Friday_women.json" --visible 
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX DOUBLES - Friday" --gender="women"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_DOUBLES_Friday_women.json" --visible 
+
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX TEAM RELAY - Friday" --gender="women"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_TEAM_RELAY_Friday_women.json" --visible 
+
+
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX PRO DOUBLES - Friday" --gender="Mixed"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_PRO_DOUBLES_Friday_Mixed.json" --visible 
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX DOUBLES - Friday" --gender="Mixed"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_DOUBLES_Friday_Mixed.json" --visible 
+
+
+python hyrox_scraper.py --url "https://results.hyrox.com/season-8/" --race="2026 Las Vegas" --division="HYROX TEAM RELAY - Friday" --gender="Mixed"  --first-name="" --last-name="" --per-page=100 -o="results_forHYROX_TEAM_RELAY_Friday_Mixed.json" --visible 
