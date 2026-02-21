@@ -68,7 +68,7 @@ def post_results(body: ResultsRequest):
             season_url=season_url,
             race=body.race,
             division=body.division,
-            workout=body.workout,
+            workout=body.workout or "Total",
             first_name=body.first_name,
             last_name=body.last_name,
             gender=body.gender,

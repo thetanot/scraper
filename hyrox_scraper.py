@@ -10,10 +10,11 @@ import hashlib
 import json
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-PROFILE_WORKERS = 6  # Reserved for future use; currently sequential for reliability
+PROFILE_WORKERS = 6  # Parallel browser processes for profile fetching
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -140,7 +141,7 @@ def scrape_hyrox_results(
         try:
             print(f"Navigating to {season_url}...")
             page.goto(season_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_selector("#default-lists-event_main_group, #form_lists_default", timeout=10000)
+            page.wait_for_selector("#default-lists-event_main_group,#default-lists-event, #form_lists_default", timeout=10000)
             time.sleep(1)
 
             if debug:
@@ -154,6 +155,15 @@ def scrape_hyrox_results(
                     page.locator("#default-lists-event_main_group").select_option(
                         label=re.compile(re.escape(race), re.I)
                     )
+                    time.sleep(1.5)
+                    # wait until division dropdown reloads with race-specific options
+                    page.wait_for_function("""
+                        () => {
+                            const el = document.querySelector('#default-lists-event');
+                            if (!el) return false;
+                            return el.options.length > 1;
+                        }
+                    """, timeout=15000)
                     time.sleep(0.5)
                 except Exception as e:
                     if debug:
@@ -161,10 +171,26 @@ def scrape_hyrox_results(
 
             if division:
                 try:
+                    div = division.strip()
+                    # Allow hyphen/en-dash/em-dash (site may use – instead of -)
+                    div_escaped = re.escape(div.replace("\u2013", "-").replace("\u2014", "-"))
+                    div_pat = div_escaped.replace(r"\-", r"[\-\u2013\u2014]") if "-" in div else div_escaped
                     page.locator("#default-lists-event").select_option(
-                        label=re.compile(re.escape(division), re.I)
+                        label=re.compile(div_pat, re.I)
                     )
                     time.sleep(0.5)
+                    # confirm the intended division was selected
+                    page.wait_for_function("""
+                        (expected) => {
+                            const el = document.querySelector('#default-lists-event');
+                            if (!el) return false;
+                            const selected = el.options[el.selectedIndex];
+                            if (!selected) return false;
+                            const text = selected.textContent.trim().toLowerCase();
+                            const exp = expected.toLowerCase();
+                            return text.includes(exp) || exp.includes(text);
+                        }
+                    """, division.strip(), timeout=10000)
                 except Exception as e:
                     if debug:
                         print(f"Division filter failed: {e}")
@@ -177,6 +203,11 @@ def scrape_hyrox_results(
                 except Exception as e:
                     if debug:
                         print(f"Workout filter failed: {e}")
+            else:
+                try:
+                    page.locator("#default-lists-ranking").select_option(label=re.compile("Total", re.I))
+                except Exception:
+                    pass
 
             if last_name:
                 page.locator("#default-lists-name").fill(last_name)
@@ -201,15 +232,13 @@ def scrape_hyrox_results(
 
             all_results, headers = _extract_results_from_page(page)
 
-            # Pagination - fetch ALL pages until no more "Next" button
-            max_pages = 500  # Safety limit
+            max_pages = 500
             page_num = 1
             while page_num < max_pages:
                 next_btn = _find_next_page_button(page)
                 if next_btn is None:
                     break
 
-                # Scroll next button into view and click
                 next_btn.scroll_into_view_if_needed()
                 next_btn.click()
                 page.wait_for_load_state("domcontentloaded")
@@ -219,7 +248,6 @@ def scrape_hyrox_results(
                 if not page_results:
                     break
 
-                # Avoid duplicates: use tuple of values as key (works for both list + table layout)
                 def _row_key(r):
                     return tuple(str(v) for v in r.values()) if r else ()
 
@@ -232,20 +260,16 @@ def scrape_hyrox_results(
                         all_results.append(r)
                         new_count += 1
                 if new_count == 0:
-                    break  # No new results (or all duplicates), we're done
+                    break
 
                 page_num += 1
 
-            # Fetch profile details for each person
             if fetch_profile_details and all_results:
                 n_profiles = len({r.get("profile_link") or "" for r in all_results if (r.get("profile_link") or "").startswith("http")})
-                print(f"Fetching profile details for {n_profiles} athletes...")
+                print(f"Fetching profile details for {n_profiles} athletes ({profile_workers} workers)...")
                 _fetch_all_profile_details(
                     context, all_results, workers=profile_workers, headless=headless
                 )
-
-            if api_results and debug:
-                print("API responses captured:", len(api_results))
 
         except PlaywrightTimeout as e:
             print(f"Timeout: {e}. Try --visible to see what's loading.")
@@ -254,6 +278,8 @@ def scrape_hyrox_results(
             if debug:
                 raise
         finally:
+            if not headless:
+                time.sleep(2)  # Pause so user can see results before close
             browser.close()
 
     if all_results:
@@ -562,13 +588,36 @@ def _fetch_person_detail(page, profile_url: str) -> dict:
         return {}
 
 
+def _fetch_profile_chunk_worker(args: tuple[list[str], bool]) -> list[tuple[str, dict]]:
+    """
+    Worker for ProcessPoolExecutor: fetch a chunk of profile URLs in a separate process.
+    Each process gets its own browser (one tab per worker).
+    """
+    urls, headless = args
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, args=BROWSER_ARGS)
+        ctx = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = ctx.new_page()
+        try:
+            for url in urls:
+                detail = _fetch_person_detail(page, url)
+                results.append((url, detail))
+                time.sleep(0.2)
+        finally:
+            browser.close()
+    return results
+
+
 def _fetch_all_profile_details(
     context,
     results: list[dict],
     workers: int = PROFILE_WORKERS,
     headless: bool = True,
 ) -> None:
-    """Fetch profile details sequentially using the existing browser context."""
+    """Fetch profile details in parallel using multiple browser processes."""
     unique_urls = []
     seen = set()
     for r in results:
@@ -580,15 +629,22 @@ def _fetch_all_profile_details(
     if not unique_urls:
         return
 
-    page = context.new_page()
+    n_workers = min(workers, len(unique_urls), 10)
+    url_chunks = [[] for _ in range(n_workers)]
+    for i, url in enumerate(unique_urls):
+        url_chunks[i % n_workers].append(url)
+
     url_to_detail: dict[str, dict] = {}
-    try:
-        for i, url in enumerate(unique_urls):
-            url_to_detail[url] = _fetch_person_detail(page, url)
-            if i < len(unique_urls) - 1:
-                time.sleep(0.3)
-    finally:
-        page.close()
+    task_args = [(chunk, headless) for chunk in url_chunks if chunk]
+
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_fetch_profile_chunk_worker, a): a for a in task_args}
+        for fut in as_completed(futures):
+            try:
+                for url, detail in fut.result():
+                    url_to_detail[url] = detail
+            except Exception:
+                pass
 
     for r in results:
         link = r.get("profile_link") or ""
