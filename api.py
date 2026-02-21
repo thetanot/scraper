@@ -72,7 +72,7 @@ def post_results(body: ResultsRequest):
             output_file="justsome.json",
             fetch_profile_details=body.fetch_profile_details,
             headless=False,
-            debug=False,
+            debug=True,  # Save debug_page.html when visible for troubleshooting
         )
     except Exception as e:
         return JSONResponse(

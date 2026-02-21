@@ -136,31 +136,80 @@ def scrape_hyrox_results(
 
         try:
             print(f"Navigating to {season_url}...")
-            page.goto(season_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_selector("#default-lists-event_main_group, #form_lists_default", timeout=10000)
+            # Ensure we're on Race Results form (pid=start) so the form is shown
+            nav_url = season_url if "?" in season_url else season_url.rstrip("/") + "?pid=start&pidp=ranking_nav"
+            page.goto(nav_url, wait_until="load", timeout=45000)
+            page.wait_for_selector("#form_lists_default", timeout=15000)
             time.sleep(1)
+
+            # Wait for form to be populated (race options loaded via JS)
+            page.wait_for_function("""
+                () => {
+                    const el = document.querySelector('#default-lists-event_main_group');
+                    return el && el.options.length >= 2;
+                }
+            """, timeout=20000)
+            time.sleep(1)
+
+            # Scroll form into view and ensure accordion is expanded
+            page.locator("#form_lists_default").first.scroll_into_view_if_needed()
 
             if debug:
                 html_path = Path("debug_page.html")
                 html_path.write_text(page.content(), encoding="utf-8")
                 print(f"Saved page HTML to {html_path}")
 
-            # Apply filters (only when specified - skip unnecessary waits)
+            # Apply filters – use value= when possible (more reliable than label)
             if race:
                 try:
-                    page.locator("#default-lists-event_main_group").select_option(
-                        label=re.compile(re.escape(race), re.I)
-                    )
-                    time.sleep(1)
-                except Exception as e:
-                    if debug:
-                        print(f"Race filter failed: {e}")
+                    race_select = page.locator("#default-lists-event_main_group")
+                    race_select.scroll_into_view_if_needed()
+                    race_select.select_option(value=race.strip())
+                    time.sleep(1.5)
+                    page.wait_for_function("""
+                        () => {
+                            const el = document.querySelector('#default-lists-event');
+                            return el && el.options.length > 1;
+                        }
+                    """, timeout=15000)
+                    time.sleep(0.5)
+                except Exception:
+                    try:
+                        race_select.select_option(label=race.strip())
+                        time.sleep(1.5)
+                        page.wait_for_function("""
+                            () => {
+                                const el = document.querySelector('#default-lists-event');
+                                return el && el.options.length > 1;
+                            }
+                        """, timeout=15000)
+                    except Exception as e:
+                        if debug:
+                            print(f"Race filter failed: {e}")
 
             if division:
                 try:
-                    page.locator("#default-lists-event").select_option(
-                        label=re.compile(re.escape(division), re.I)
-                    )
+                    div_text = division.strip().replace("\u2013", "-").replace("\u2014", "-").lower()
+                    selected = page.evaluate("""
+                        (searchText) => {
+                            const norm = (s) => (s || '').replace(/[\u2013\u2014]/g, '-').trim().toLowerCase();
+                            const sel = document.querySelector('#default-lists-event');
+                            if (!sel) return false;
+                            const opts = sel.options;
+                            const n = norm(searchText);
+                            for (let i = 0; i < opts.length; i++) {
+                                const text = norm(opts[i].textContent || '');
+                                if (text.includes(n) || n.includes(text)) {
+                                    sel.selectedIndex = i;
+                                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                    """, div_text)
+                    if not selected and debug:
+                        print(f"Division '{division}' not found in dropdown")
                     time.sleep(0.5)
                 except Exception as e:
                     if debug:
@@ -168,8 +217,9 @@ def scrape_hyrox_results(
 
             if workout:
                 try:
+                    page.locator("#default-lists-ranking").scroll_into_view_if_needed()
                     page.locator("#default-lists-ranking").select_option(
-                        label=re.compile(re.escape(workout), re.I)
+                        label=workout.strip()
                     )
                 except Exception as e:
                     if debug:
@@ -180,15 +230,18 @@ def scrape_hyrox_results(
             if first_name:
                 page.locator("#default-lists-firstname").fill(first_name)
             if gender:
-                page.locator("#default-lists-sex").select_option(label=re.compile(re.escape(gender), re.I))
+                g = gender.strip()
+                g_map = {"men": "Men", "women": "Women", "mixed": "Mixed"}
+                page.locator("#default-lists-sex").select_option(label=g_map.get(g.lower(), g))
             if age_group:
-                page.locator("#default-lists-age_class").select_option(label=re.compile(re.escape(age_group), re.I))
+                page.locator("#default-lists-age_class").select_option(label=age_group.strip())
             if nationality:
-                page.locator("#default-lists-nation").select_option(label=re.compile(re.escape(nationality), re.I))
+                page.locator("#default-lists-nation").select_option(label=nationality.strip())
 
             page.locator("#default-num_results").select_option(value=str(min(results_per_page, 100)))
 
             show_btn = page.locator("#default-submit, button:has-text('Show Results')").first
+            show_btn.scroll_into_view_if_needed()
             show_btn.click()
             page.wait_for_selector(
                 "li:has(.type-fullname), li:has(.place-primary), table.results tbody tr, .list-list",
@@ -248,6 +301,9 @@ def scrape_hyrox_results(
             if debug:
                 raise
         finally:
+            if not headless:
+                print("Keeping browser open for 10 seconds so you can inspect...")
+                time.sleep(10)
             browser.close()
 
     if all_results:
@@ -631,7 +687,7 @@ def fetch_form_options(
             if race and result["races"]:
                 try:
                     page.locator("#default-lists-event_main_group").select_option(
-                        label=re.compile(re.escape(race), re.I)
+                        label=race
                     )
                     time.sleep(1)
                 except Exception:
